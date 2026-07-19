@@ -11,6 +11,7 @@ passlib[bcrypt]>=1.7.4
 itsdangerous>=2.2.0
 python-dotenv>=1.1.0
 sqlalchemy
+app
 websockets>=15.0
 cryptography>=45.0.0
 bcrypt>=4.3.0
