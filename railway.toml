@@ -1,0 +1,16 @@
+# Railway deployment configuration
+# https://docs.railway.app/deploy/config-as-code
+
+[build]
+  builder = "DOCKERFILE"
+  dockerfile = "Dockerfile"
+
+[deploy]
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 10
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[variables]
+  PYTHONUNBUFFERED = "1"
