@@ -342,6 +342,19 @@ async def startup():
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"Spider Gateway v9.2 started on port {CONFIG['port']}")
 
+    # Auto-start Telegram bot if configured (no circular import)
+    try:
+        bot_token = SETTINGS.get("telegram_bot", {}).get("bot_token")
+        bot_enabled = bool(SETTINGS.get("telegram_bot", {}).get("enabled"))
+        if bot_token and bot_enabled:
+            from bot_integration import _start_bot_task
+            asyncio.create_task(_start_bot_task())
+            logger.info("Telegram bot auto-started")
+        else:
+            logger.debug("Telegram bot not auto-started (disabled or no token)")
+    except Exception as e:
+        logger.warning(f"Failed to auto-start Telegram bot: {e}")
+
 @app.on_event("shutdown")
 async def shutdown():
     await save_state()
@@ -3130,7 +3143,7 @@ async def server_stats_http(_=Depends(require_auth)):
     return get_live_stats()
 
 
-def create_user_internal(username: str, password: str, traffic_limit_gb: float = 0, expire_days: int = 0, protocol: str = "vless", concurrent_connections: int = 3, server: str = "IR-Tehran-01") -> dict:
+def create_user_internal(username: str, password: str, traffic_limit_gb: float = 0, expire_days: int = 0, protocol: str = "vless", concurrent_connections: int = 3, server: str = "IR-Tehran-01", telegram_id: int = None) -> dict:
     """Create a new user from internal code (bot / API) — mirrors POST /api/users but returns a dict."""
     username = (username or "user").strip()[:40]
     password = str(password or secrets.token_urlsafe(12))
@@ -3168,6 +3181,7 @@ def create_user_internal(username: str, password: str, traffic_limit_gb: float =
         "path": f"/ws/{config_uuid}",
         "transport_type": "ws",
         "inbound_id": None,
+        "telegram_id": telegram_id,
     }
     LINKS[config_uuid] = {
         "label": username,
@@ -3240,6 +3254,144 @@ def get_server_stats() -> dict:
             "total_users": len(USERS),
             "server_status": "healthy",
         }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPIDER IP — Client list + Mix subscription
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/spider-ips")
+async def list_spider_clients(_=Depends(require_auth)):
+    """Return all clients (users) with their config_uuid, vless link, and subscription URL.
+    Used by the Spider IP tab to test each client's config against discovered IPs."""
+    host = SETTINGS.get("domain") or get_host()
+    async with USERS_LOCK:
+        snap_users = dict(USERS)
+    result = []
+    for uid, u in snap_users.items():
+        cfg_uuid = u.get("config_uuid", "")
+        result.append({
+            "user_id": uid,
+            "username": u.get("username", ""),
+            "config_uuid": cfg_uuid,
+            "protocol": u.get("protocol", "vless"),
+            "status": u.get("status", "active"),
+            "server": u.get("server", ""),
+            "vless_link": generate_user_config(uid, u, u.get("inbound_id")),
+            "subscription_url": f"https://{host}/api/users/{uid}/subscription",
+            "config_url": f"https://{host}/api/users/{uid}/config",
+            "created_at": u.get("created_at", ""),
+        })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"clients": result}
+
+
+@app.post("/api/spider-ips/mix")
+async def create_mix_subscription(request: Request, _=Depends(require_auth)):
+    """Create a MIX subscription from selected client config_uuids.
+    
+    Body: { name, client_uuids: [config_uuid, ...] }
+    The MIX sub contains all the selected clients' links (multi-location).
+    Also stores location per IP if provided.
+    """
+    body = await request.json()
+    name = (body.get("name") or "MIX Subscription").strip()[:60]
+    client_uuids = body.get("client_uuids", [])
+    if not isinstance(client_uuids, list) or not client_uuids:
+        raise HTTPException(status_code=400, detail="client_uuids required")
+
+    # Map config_uuid -> link id (LINKS keyed by config_uuid)
+    link_ids = []
+    async with LINKS_LOCK:
+        snap_links = dict(LINKS)
+    for cu in client_uuids:
+        if cu in snap_links:
+            link_ids.append(cu)
+
+    if not link_ids:
+        raise HTTPException(status_code=400, detail="No valid client links found")
+
+    sub_id = generate_uuid()
+    uuid_key = secrets.token_urlsafe(16)
+    async with SUBS_LOCK:
+        SUBS[sub_id] = {
+            "name": name,
+            "desc": "MIX multi-location subscription",
+            "password_hash": None,
+            "uuid_key": uuid_key,
+            "created_at": datetime.now().isoformat(),
+            "link_ids": link_ids,
+            "is_mix": True,
+        }
+    asyncio.create_task(save_state())
+    log_activity("sub", f"ساب MIX «{name}» ساخته شد ({len(link_ids)} کلاینت)", "ok")
+    host = SETTINGS.get("domain") or get_host()
+    return {
+        "sub_id": sub_id,
+        "name": name,
+        "uuid_key": uuid_key,
+        "links_count": len(link_ids),
+        "public_url": f"https://{host}/p/{uuid_key}",
+        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        "is_mix": True,
+    }
+
+
+@app.get("/api/subscriptions")
+async def get_subscriptions(_=Depends(require_auth)):
+    """Return all subscriptions (including MIX subscriptions) with client details."""
+    host = SETTINGS.get("domain") or get_host()
+    async with SUBS_LOCK:
+        snap_subs = dict(SUBS)
+    async with LINKS_LOCK:
+        snap_links = dict(LINKS)
+    async with USERS_LOCK:
+        snap_users = dict(USERS)
+    result = []
+    for sid, s in snap_subs.items():
+        link_ids = s.get("link_ids", [])
+        active_count = sum(1 for lid in link_ids if is_link_allowed(snap_links.get(lid)))
+        total_used = sum(snap_links[lid].get("used_bytes", 0) for lid in link_ids if lid in snap_links)
+        # Get client usernames for linked configs
+        client_names = []
+        for lid in link_ids:
+            for uid, u in snap_users.items():
+                if u.get("config_uuid") == lid:
+                    client_names.append(u.get("username", lid[:8]))
+                    break
+        result.append({
+            "sub_id": sid,
+            **s,
+            "password_hash": None,
+            "has_password": s.get("password_hash") is not None,
+            "links_count": len(link_ids),
+            "active_count": active_count,
+            "total_used_bytes": total_used,
+            "total_used_fmt": fmt_bytes(total_used),
+            "is_mix": s.get("is_mix", False),
+            "client_names": client_names,
+            "public_url": f"https://{host}/p/{s.get('uuid_key', '')}",
+            "sub_url": f"https://{host}/sub-group/{s.get('uuid_key', '')}",
+        })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"subscriptions": result}
+
+
+@app.delete("/api/subscriptions/{sub_id}")
+async def delete_subscription(sub_id: str, _=Depends(require_auth)):
+    """Delete a subscription by ID."""
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        name = SUBS[sub_id].get("name", sub_id)
+        del SUBS[sub_id]
+    async with LINKS_LOCK:
+        for link in LINKS.values():
+            if link.get("sub_id") == sub_id:
+                link["sub_id"] = None
+    asyncio.create_task(save_state())
+    log_activity("sub", f"اشتراک «{name}» حذف شد", "warn")
+    return {"ok": True, "deleted": sub_id}
 
 
 # ── Static files mount (MUST be after all routes) ──

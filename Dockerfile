@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     libffi8 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -38,21 +39,16 @@ COPY main.py .
 COPY bot_integration.py .
 COPY pages.py .
 COPY static/ static/
-COPY requirements.txt .
 
-# Create directories for state and uploads
-RUN mkdir -p /app/state /app/static/uploads
+# Create data directory for state persistence
+RUN mkdir -p /data /app/static/uploads
 
-# Expose port (Railway provides PORT env var)
-EXPOSE 8000
-
-# Non-root user for security
-RUN useradd -m -u 1000 spider && chown -R spider:spider /app
-USER spider
+# Expose default port (overridable via $PORT env var)
+EXPOSE 8765
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import httpx, sys; r=httpx.get('http://localhost:8000/health', timeout=3); sys.exit(0 if r.status_code==200 else 1)"
+HEALTHCHECK --interval=60s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import http.client; c=http.client.HTTPConnection('localhost', int(__import__('os').environ.get('PORT', 8765))); c.request('GET', '/health'); r=c.getresponse(); exit(0 if r.status==200 else 1)"
 
-# Start command
+# Start with uvicorn (main.py handles the run)
 CMD ["python", "main.py"]

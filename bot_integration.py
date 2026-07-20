@@ -89,13 +89,19 @@ def _get_state_helpers():
     return _m.save_state, _m.log_activity, _m.hash_password, _m.generate_short_id, _m.generate_uuid
 
 
-async def _require_auth(request: Request):
-    """Wrapper that can be used as FastAPI dependency in this module.
-
-    Delegates to main.require_auth (imported lazily to avoid circular imports).
-    """
-    import main as _m
-    return await _m.require_auth(request)
+async def _auto_start_bot_if_configured():
+    """Auto-start bot on app startup if settings say enabled=True and token is set."""
+    try:
+        import main as _m
+        SETTINGS = _m.SETTINGS
+        tb = SETTINGS.get("telegram_bot", {})
+        if tb.get("enabled") and tb.get("bot_token"):
+            logger.info("Auto-starting Telegram bot (enabled in settings)")
+            await _start_bot_task()
+        else:
+            logger.debug("Telegram bot not auto-started (disabled or no token)")
+    except Exception as e:
+        logger.warning(f"Failed to auto-start Telegram bot: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
